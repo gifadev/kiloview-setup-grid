@@ -1,62 +1,68 @@
+# core/actions/layouts.py
+from __future__ import annotations
 from playwright.sync_api import Page, Error
-from ..ui_selectors import (
-    LAYOUT_DROPDOWN_INPUT,
-    LAYOUT_OPTION_ROW,
-    LAYOUT_DIALOG,
-    LAYOUT_CONFIRM_OK,
-    GRID_CELL,
-)
 
-def _cells_to_title(cells: int) -> str:
-    mapping = {1: "Single", 4: "2x2", 9: "3x3", 16: "4x4"}
-    if cells in mapping:
-        return mapping[cells]
-    raise ValueError(f"layout cells {cells} tidak dikenali. Pakai 1/4/9/16.")
+# --- Selectors yang stabil dari DOM yang kamu kirim ---
+SEL_LAYOUT_SELECT = ".layout-setting-box .el-select"                  # tombol dropdown
+SEL_LAYOUT_DROPDOWN = ".layout-tool-select"                           # container dropdown
+SEL_LAYOUT_OPTION = ".layout-tool-select .layout-select-option"       # setiap item pilihan
 
-def select_layout(page: Page, cells: int, auto_confirm: bool = False, timeout_ms: int = 8000):
-    title = _cells_to_title(cells)
+# Modal konfirmasi "Layout shift will lose unsaved data..."
+SEL_MODAL_WRAPPER = "div.el-message-box__wrapper"
+SEL_MODAL_OK = f"{SEL_MODAL_WRAPPER} .el-button--primary"             # tombol OK
+SEL_MODAL_CANCEL = f"{SEL_MODAL_WRAPPER} .el-button--default"         # tombol Cancel
 
-    # buka dropdown
-    dd = page.locator(LAYOUT_DROPDOWN_INPUT).first
-    dd.wait_for(state="visible", timeout=timeout_ms)
-    dd.click()
+# Grid item (untuk nunggu perubahan layout selesai)
+SEL_GRID_ITEM = ".layout-grid-content .grid-list-item"
 
-    # pilih item berdasarkan teks judul
-    opt = page.locator(LAYOUT_OPTION_ROW).filter(has_text=title).first
-    opt.wait_for(state="visible", timeout=timeout_ms)
-    opt.click()
 
-    # konfirmasi dialog jika muncul
-    if auto_confirm:
-        try:
-            page.wait_for_selector(LAYOUT_DIALOG, timeout=1500)
-            page.locator(LAYOUT_CONFIRM_OK).click()
-        except Error:
-            pass
-    else:
-        pass
-
+def _maybe_handle_layout_shift_modal(page: Page, confirm: bool = True, timeout_ms: int = 1500) -> None:
+    """
+    Jika popup muncul, klik OK (confirm=True) atau Cancel (confirm=False).
+    Jika tidak muncul, diabaikan.
+    """
     try:
-        page.wait_for_function(
-            "(cfg) => document.querySelectorAll(cfg.sel).length === cfg.expected",
-            arg={"sel": GRID_CELL, "expected": cells},
-            timeout=5000,
+        modal = page.locator(SEL_MODAL_WRAPPER).filter(
+            has_text="Layout shift will lose unsaved data"
         )
+        modal.wait_for(state="visible", timeout=timeout_ms)
+        if confirm:
+            page.locator(SEL_MODAL_OK).click()
+        else:
+            # biasanya tombol Cancel adalah .el-button--default pertama
+            page.locator(SEL_MODAL_CANCEL).first.click()
     except Error:
+        # tidak ada modal — aman
         pass
 
-def confirm_layout_shift(page: Page, timeout_ms: int = 3000) -> None:
+
+def select_layout(page: Page, cells: int, confirm: bool = True, timeout_ms: int = 10_000) -> None:
+    """
+    Pilih layout berdasarkan jumlah cell: 1 (Single), 4 (2x2), 9 (3x3), 16 (4x4), ...
+    Akan otomatis meng-OK popup layout-shift jika 'confirm=True'.
+    """
+    label_map = {1: "Single", 4: "2x2", 9: "3x3", 16: "4x4"}
+    label = label_map.get(cells)
+    if label is None:
+        raise ValueError(f"cells '{cells}' tidak didukung. Pilihan: {sorted(label_map.keys())}")
+
+    # Buka dropdown
+    page.locator(SEL_LAYOUT_SELECT).click()
+    page.locator(SEL_LAYOUT_DROPDOWN).wait_for(state="visible", timeout=timeout_ms)
+
+    # Klik opsi sesuai label
+    option = page.locator(SEL_LAYOUT_OPTION).filter(has_text=label).first
+    if option.count() == 0:
+        raise RuntimeError(f"Layout '{label}' tidak ditemukan di dropdown")
+    option.click()
+
+    # Tangani modal konfirmasi jika muncul
+    _maybe_handle_layout_shift_modal(page, confirm=confirm, timeout_ms=1500)
+
+    # Tunggu grid terbentuk sesuai jumlah cell (best effort)
     try:
-        # modal wrapper Element-UI
-        page.wait_for_selector('.el-message-box__wrapper[aria-modal="true"]',
-                               state='visible', timeout=timeout_ms)
-        ok_btn = page.locator('.el-message-box__btns .el-button--primary')
-        if ok_btn.count() > 0:
-            ok_btn.first.click()
-        else:
-            page.get_by_role("button", name="OK").click()
-        # tunggu modal tertutup
-        page.wait_for_selector('.el-message-box__wrapper', state='detached',
-                               timeout=timeout_ms)
+        # pastikan minimal index ke-(cells-1) sudah ada/visible
+        page.locator(SEL_GRID_ITEM).nth(cells - 1).wait_for(state="visible", timeout=timeout_ms)
     except Error:
+        # kadang animasi cepat; jika gagal tunggu, tetap lanjut
         pass

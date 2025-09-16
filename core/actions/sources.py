@@ -5,6 +5,8 @@ import time
 from typing import List, Dict, Tuple, Optional
 
 from playwright.sync_api import Page, Error
+GRID_CELL_SEL = ".layout-grid-content .grid-list-item"
+SOURCE_ITEM_SEL = "div.discovery-list-item"
 
 
 def _find_source_item(page: Page, name: str):
@@ -67,31 +69,68 @@ def _grid_cell_by_index(page: Page, grid_index_1based: int):
     return cells.nth(idx0)
 
 
-def activate_grid_cell(page: Page, grid_index_1based: int):
-    cell = _grid_cell_by_index(page, grid_index_1based)
-    cell.scroll_into_view_if_needed()
-    cell.click()
-    # tunggu jadi active
-    page.wait_for_function(
-        "el => el.classList && el.classList.contains('active-item')",
-        arg=cell,
-        timeout=1_200,
-    )
+def activate_grid_cell(page: Page, grid_index_1based: int, timeout_ms: int = 5000):
+    idx = grid_index_1based - 1
+    cells = page.locator(GRID_CELL_SEL)
+
+    # 1) Pastikan sel ke-idx sudah ter-attach
+    cells.nth(idx).wait_for(state="attached", timeout=timeout_ms)
+    target = cells.nth(idx)
+
+    # (opsional) scroll biar aman di headless
+    try:
+        target.scroll_into_view_if_needed()
+    except Exception:
+        pass
+
+    # 2) Klik sel
+    target.click()
+
+    # 3) Tunggu sampai sel itu jadi "active-item" (pakai index, bukan handle)
+    def _wait_active(idx: int, timeout: int):
+        page.wait_for_function(
+            """
+            (i) => {
+              const nodes = document.querySelectorAll('.layout-grid-content .grid-list-item');
+              const el = nodes[i];
+              return !!el && el.classList && el.classList.contains('active-item');
+            }
+            """,
+            arg=idx,
+            timeout=timeout
+        )
+
+    try:
+        _wait_active(idx, 2000)
+    except Error:
+        # Retry sekali lagi (klik lagi, lalu tunggu lebih lama)
+        target.click()
+        page.wait_for_timeout(150)
+        _wait_active(idx, 3000)
 
 
 def assign_source_to_grid(page: Page, grid_index_1based: int, source_name: str):
+    # Aktivasi sel grid tujuan
     activate_grid_cell(page, grid_index_1based)
-    item = _find_source_item(page, source_name)
-    if not item or item.count() == 0:
-        raise RuntimeError(f"Source '{source_name}' tidak ditemukan.")
 
+    # Cari item source berdasarkan nama
+    # Catatan: filter by text; jika nama mengandung spasi/kapital, tetap cocokkan apa adanya
+    src = page.locator(SOURCE_ITEM_SEL).filter(has_text=source_name).first
+
+    # Pastikan ada
+    src.wait_for(state="visible", timeout=5000)
+
+    # Scroll biar aman
     try:
-        item.scroll_into_view_if_needed(timeout=2_000)
-    except Error:
+        src.scroll_into_view_if_needed()
+    except Exception:
         pass
 
-    item.dblclick()
-    time.sleep(0.2)
+    # UI kamu butuh double-click untuk “push” ke grid
+    src.dblclick(timeout=3000)
+
+    # (opsional) kecilkan jeda agar UI sempat update
+    page.wait_for_timeout(200)
 
 def _wait_visible_dialog(page: Page):
     dlg = page.locator(".el-dialog__wrapper:visible, .el-message-box__wrapper:visible")
