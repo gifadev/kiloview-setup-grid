@@ -1,0 +1,12 @@
+beautifulsoup4
+lxml
+requests
+pyyaml
+fastapi 
+uvicorn 
+pydantic
+python-dotenv
+playwright==1.48.0
+
+#run on terminal
+# playwright install chromium --with-deps
