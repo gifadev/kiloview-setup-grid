@@ -8,12 +8,13 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
+from get_rtmp import fetch_rtmp as android_fetch_rtmp
 from core.browser import launch_browser
 from core.auth import login, wait_for_dashboard
 from core.actions.layouts import select_layout
 from core.actions.sources import list_sources, assign_source_to_grid, set_source_url
 from core import utils
+from fastapi.responses import PlainTextResponse
 
 load_dotenv()
 
@@ -216,7 +217,43 @@ def run_combined(req: RunCombinedReq):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to run combined: {e}")
 
+class AndroidRtmpResp(BaseModel):
+    ok: bool
+    rtmp: Optional[str] = None
+    detail: Optional[str] = None
 
+@app.get("/android/rtmp", response_model=AndroidRtmpResp)
+def android_get_rtmp(
+    package: str = "com.ybws.newmlive",
+    do_login_taps: bool = True,
+    max_retries: int = 5,
+    scroll_attempts: int = 3,
+):
+    """
+    Jalankan flow ADB di device Android dan ambil link RTMP yang tampil di UI.
+    Query params bisa disesuaikan:
+    - package: nama paket aplikasi Android
+    - do_login_taps: jalankan ketukan login default
+    - max_retries / scroll_attempts: kontrol scanning layar
+    """
+    with _device_lock:
+        try:
+            link = android_fetch_rtmp(
+                package=package,
+                do_login_taps=do_login_taps,
+                max_retries=max_retries,
+                scroll_attempts=scroll_attempts,
+            )
+            if not link:
+                # 404 lebih tepat kalau tidak ditemukan
+                raise HTTPException(status_code=404, detail="RTMP link not found on screen")
+            return AndroidRtmpResp(ok=True, rtmp=link)
+        except HTTPException:
+            # biarkan apa adanya
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch RTMP: {e}")
+        
 if __name__ == "__main__":
     import uvicorn
     host = os.getenv("API_HOST")
