@@ -1,2 +1,4 @@
 /scenarios/login_only.yaml
 .env
+__pycache__
+/out
