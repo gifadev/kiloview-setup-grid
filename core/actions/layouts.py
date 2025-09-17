@@ -41,7 +41,13 @@ def select_layout(page: Page, cells: int, confirm: bool = True, timeout_ms: int 
     Pilih layout berdasarkan jumlah cell: 1 (Single), 4 (2x2), 9 (3x3), 16 (4x4), ...
     Akan otomatis meng-OK popup layout-shift jika 'confirm=True'.
     """
-    label_map = {1: "Single", 4: "2x2", 9: "3x3", 16: "4x4"}
+    label_map = {
+        1:  "Single",
+        2:  "PIP",   
+        4:  "2x2",
+        9:  "3x3",
+        16: "4x4",
+    }
     label = label_map.get(cells)
     if label is None:
         raise ValueError(f"cells '{cells}' tidak didukung. Pilihan: {sorted(label_map.keys())}")
