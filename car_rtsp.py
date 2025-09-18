@@ -37,7 +37,7 @@ CAMERA_MAP: Dict[str, List[Tuple[str, int]]] = {
     #     ("Kanan", 2),
     #     ("Kiri", 3),
     # ],
-    "14882506144": [
+    "014882506144": [
         ("Car Camera 1", 0),
         ("Car Camera 2", 1),
         ("Car Camera 3", 2),
@@ -47,6 +47,9 @@ CAMERA_MAP: Dict[str, List[Tuple[str, int]]] = {
         ("Car Camera 7", 6),
         ("Car Camera 8", 7),
     ],
+    "25045736425":[
+        ("Body Worn", 0)
+    ]
 }
 
 # ===================== HELPERS =====================
