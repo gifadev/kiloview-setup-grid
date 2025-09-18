@@ -1,0 +1,15 @@
+{
+  "014882506144": [
+    { "name": "Car Camera 1", "channel": 0 },
+    { "name": "Car Camera 2", "channel": 1 },
+    { "name": "Car Camera 3", "channel": 2 },
+    { "name": "Car Camera 4", "channel": 3 },
+    { "name": "Car Camera 5", "channel": 4 },
+    { "name": "Car Camera 6", "channel": 5 },
+    { "name": "Car Camera 7", "channel": 6 },
+    { "name": "Car Camera 8", "channel": 7 }
+  ],
+  "25045736425": [
+    { "name": "Body Worn", "channel": 0 }
+  ]
+}

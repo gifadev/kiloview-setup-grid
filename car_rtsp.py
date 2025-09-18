@@ -9,6 +9,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
+import json
 
 load_dotenv()
 
@@ -29,28 +30,19 @@ POST_TIMEOUT     = float(os.getenv("POST_TIMEOUT") or 10.0)
 POST_MAX_RETRY   = int(os.getenv("POST_MAX_RETRY") or 2)
 DRY_RUN          = (os.getenv("DRY_RUN") or "false").lower() in ("1", "true", "yes")
 
-# Peta kamera: key bisa DevIDNO atau vehiIdno (plat)
-CAMERA_MAP: Dict[str, List[Tuple[str, int]]] = {
-    # "B2222KJA": [
-    #     ("Depan", 0),
-    #     ("Kabin", 1),
-    #     ("Kanan", 2),
-    #     ("Kiri", 3),
-    # ],
-    "014882506144": [
-        ("Car Camera 1", 0),
-        ("Car Camera 2", 1),
-        ("Car Camera 3", 2),
-        ("Car Camera 4", 3),
-        ("Car Camera 5", 4),
-        ("Car Camera 6", 5),
-        ("Car Camera 7", 6),
-        ("Car Camera 8", 7),
-    ],
-    "25045736425":[
-        ("Body Worn", 0)
-    ]
-}
+def load_camera_map() -> dict:
+    path = os.getenv("CAMERA_MAP_PATH")
+    if not path:
+        raise RuntimeError("CAMERA_MAP_PATH belum di-set di .env")
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    cmap = {}
+    for key, items in raw.items():
+        cmap[key] = [(item["name"], int(item["channel"])) for item in items]
+    return cmap
+
+CAMERA_MAP = load_camera_map()
+
 
 # ===================== HELPERS =====================
 def ensure_env():
