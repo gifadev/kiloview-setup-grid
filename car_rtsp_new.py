@@ -1,23 +1,18 @@
-#!/usr/bin/env python3
-# cmsv8_rtsp_to_endpoint.py
-#
-# Perubahan penting:
-# - NAME_MODE default "simple" => 'name' yang dikirim = cam_name dari CAMERA_MAP
-#   (agar cocok dengan "Source" yang sudah ada di server).
-# - Kirim PER 3 URL (CLIENT_BATCH_SIZE) + fallback per-item jika batch gagal.
-# - POST tanpa auto-retry urllib3; header "Connection: close" (meniru curl).
-
 import os
 import re
 import time
 import random
 import json
-from typing import Iterable, List
+from typing import Iterable, List, Tuple
+from pathlib import Path
+from datetime import datetime, timedelta
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
+# ===================== ENV =====================
 load_dotenv()
 
 # ===================== CONFIG =====================
@@ -35,28 +30,29 @@ POST_TIMEOUT           = float(os.getenv("POST_TIMEOUT") or 20.0)
 POST_MAX_RETRY         = int(os.getenv("POST_MAX_RETRY") or 1)
 DRY_RUN                = (os.getenv("DRY_RUN") or "false").lower() in ("1", "true", "yes")
 
-CLIENT_BATCH_SIZE      = int(os.getenv("CLIENT_BATCH_SIZE") or 3)
+CLIENT_BATCH_SIZE      = int(os.getenv("CLIENT_BATCH_SIZE") or 3)  # TETAP 3 sesuai requirement
 SLEEP_BETWEEN_BATCH    = float(os.getenv("SLEEP_BETWEEN_BATCH") or 0.5)
 INITIAL_BACKOFF        = float(os.getenv("INITIAL_BACKOFF") or 0.8)
 BACKOFF_CAP            = float(os.getenv("BACKOFF_CAP") or 5.0)
 MAX_FALLBACK_SPLIT     = int(os.getenv("MAX_FALLBACK_SPLIT") or 1)
 
-# Strategi penamaan untuk field "name" yang dikirim ke server:
-# - "simple" (default): pakai cam_name langsung (SUPAYA COCOK DENGAN SOURCE DI SERVER)
-# - "full": pakai "key/did - cam_name (chX)" seperti versi lama
-NAME_MODE              = (os.getenv("NAME_MODE") or "simple").lower()
+# Loop & session
+RESCAN_INTERVAL_SECONDS = int(os.getenv("RESCAN_INTERVAL_SECONDS") or 20)   # default 20 detik
+SESSION_MAX_AGE_SECONDS = int(os.getenv("SESSION_MAX_AGE_SECONDS") or 1200) # default 20 menit
+STARTUP_GRACE_SECONDS   = int(os.getenv("STARTUP_GRACE_SECONDS") or 0)      # opsional; 0=tanpa grace
+ALWAYS_LOGIN_EACH_LOOP  = (os.getenv("ALWAYS_LOGIN_EACH_LOOP") or "false").lower() in ("1","true","yes")
+
+# Cache: simpan di folder yang sama dengan file .py ini
+_SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CACHE = _SCRIPT_DIR / "last_sent.json"
+PERSIST_CACHE_PATH = os.getenv("PERSIST_CACHE_PATH") or str(DEFAULT_CACHE)
+
+# Penamaan "name" yang dikirim ke server:
+# - "simple": pakai cam_name langsung (cocok dengan Source di server)
+# - "full"  : "key/did - cam_name (chX)"
+NAME_MODE = (os.getenv("NAME_MODE") or "simple").lower()
 
 def load_camera_map() -> dict:
-    """
-    CAMERA_MAP_PATH JSON format contoh:
-    {
-      "014882506144": [
-        {"name": "Car Camera 1", "channel": 0},
-        {"name": "Car Camera 2", "channel": 1},
-        {"name": "Body Worn",    "channel": 7}
-      ]
-    }
-    """
     path = os.getenv("CAMERA_MAP_PATH")
     if not path:
         raise RuntimeError("CAMERA_MAP_PATH belum di-set di .env")
@@ -107,6 +103,24 @@ def make_session() -> requests.Session:
 
 def _sleep_with_jitter(base: float):
     time.sleep(base + random.uniform(0, base * 0.35))
+
+# ===== Cache persist =====
+def _load_cache() -> dict:
+    p = Path(PERSIST_CACHE_PATH)
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return {}
+    try:
+        return json.loads(p.read_text("utf-8"))
+    except Exception:
+        return {}
+
+def _save_cache(cache: dict):
+    p = Path(PERSIST_CACHE_PATH)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
 
 # ===================== CORE (CMSV8) =====================
 def login(session: requests.Session) -> str:
@@ -159,6 +173,7 @@ def get_online_devices(session: requests.Session, jsession: str, key: str) -> Li
     return fallback_status(session, jsession, key)
 
 def build_rtsp(jsession: str, devidno: str, channel: int, stream: int = DEFAULT_STREAM) -> str:
+    # path "rtmp://.../3/3" sesuai pola yang kamu pakai
     return (
         f"rtmp://{IP_STREAM}:{RTSP_PORT}/3/3"
         f"?AVType=1&jsession={jsession}&DevIDNO={devidno}"
@@ -166,14 +181,8 @@ def build_rtsp(jsession: str, devidno: str, channel: int, stream: int = DEFAULT_
     )
 
 def choose_display_name(cam_name: str, key: str, did: str, ch: int) -> str:
-    """
-    Tentukan 'name' yang dikirim ke server.
-    - simple: pakai cam_name (agar cocok dengan nama "Source" yang sudah ada di server)
-    - full:   pakai "key/did - cam_name (chX)" (gaya lama)
-    """
     if NAME_MODE == "full":
         return safe_name(f"{key}/{did} - {cam_name} (ch{ch})")
-    # default simple
     return safe_name(cam_name)
 
 # ===================== POSTER =====================
@@ -191,11 +200,16 @@ def _post_once(session: requests.Session, url: str, payload: dict, timeout: floa
     except Exception as e:
         return False, f"EXC:{e}", -1
 
-def post_set_urls(session: requests.Session, items: List[dict]) -> bool:
-    """Kirim batch kecil; kalau gagal 5xx/EXC, fallback per-item."""
+def post_set_urls(session: requests.Session, items: List[dict]) -> Tuple[bool, List[dict]]:
+    """
+    Kirim batch kecil; kalau gagal 5xx/EXC, fallback per-item.
+    RETURN:
+      - all_ok: bool
+      - succeeded_items: list[dict] yang sukses terkirim (untuk update cache presisi)
+    """
     if DRY_RUN:
         print(f"[DRY] Akan POST {len(items)} item ke {ENDPOINT_URL}")
-        return True
+        return True, list(items)
 
     payload = {"set_urls": items}
     attempt = 0
@@ -206,96 +220,140 @@ def post_set_urls(session: requests.Session, items: List[dict]) -> bool:
         ok, body, code = _post_once(session, ENDPOINT_URL, payload, POST_TIMEOUT)
         if ok:
             print(f"[OK] POST set_urls={len(items)} status={code}")
-            return True
+            return True, list(items)
 
         print(f"[ERR] POST batch size={len(items)} status={code} body={body!r}")
 
         # Fallback: 5xx/EXC dan batch > 1 → kirim per-item
         if (500 <= code < 600 or code == -1) and len(items) > 1 and MAX_FALLBACK_SPLIT >= 1:
             print("[INFO] Fallback: kirim per-item untuk isolasi URL bermasalah...")
-            all_ok = True
+            succeeded = []
             for it in items:
                 ok1, body1, code1 = _post_once(session, ENDPOINT_URL, {"set_urls": [it]}, POST_TIMEOUT)
                 if ok1:
                     print(f"  [OK] {it.get('name')} status={code1}")
+                    succeeded.append(it)
                 else:
                     print(f"  [ERR] {it.get('name')} status={code1} body={body1!r}")
-                    all_ok = False
                 _sleep_with_jitter(0.25)
-            return all_ok
+            return (len(succeeded) == len(items)), succeeded
 
         if attempt > POST_MAX_RETRY:
             print("[ERR] Gagal POST setelah retry.")
-            return False
+            return False, []
 
         print(f"[INFO] Retry dalam {min(backoff, BACKOFF_CAP):.1f}s ...")
         _sleep_with_jitter(min(backoff, BACKOFF_CAP))
         backoff *= 2.0
 
-# ===================== MAIN =====================
-def main():
+# ===================== SNAPSHOT & DIFF =====================
+def collect_snapshot(session: requests.Session, jsession: str) -> List[dict]:
+    """Kembalikan list item {name,url} untuk SEMUA device online saat ini."""
+    items = []
+    for key, cam_list in CAMERA_MAP.items():
+        try:
+            online_devs = get_online_devices(session, jsession, key)
+        except Exception as e:
+            print(f"[WARN] Gagal ambil device '{key}': {e}")
+            online_devs = []
+
+        if not online_devs:
+            continue
+
+        for did in online_devs:
+            for cam_name, ch in cam_list:
+                url = build_rtsp(jsession, devidno=did, channel=ch, stream=DEFAULT_STREAM)
+                name = choose_display_name(cam_name, key, did, ch)
+                items.append({"name": name, "url": url})
+    return items
+
+def diff_delta(snapshot: List[dict], cache: dict) -> List[dict]:
+    """Ambil item yang baru/berubah dibanding cache {name:url}."""
+    delta = []
+    for it in snapshot:
+        nm, url = it["name"], it["url"]
+        if cache.get(nm) != url:
+            delta.append(it)
+    return delta
+
+# ===================== LOOP MODE =====================
+def loop_resilient():
     ensure_env()
+    if STARTUP_GRACE_SECONDS > 0:
+        print(f"[BOOT] Grace period {STARTUP_GRACE_SECONDS}s …")
+        time.sleep(STARTUP_GRACE_SECONDS)
+
+    cache = _load_cache()
     with make_session() as s:
-        # 1) Login CMSV8
-        jsession = login(s)
-        print(f"[OK] Login sukses. JSESSIONID={jsession}")
+        jsession = None
+        js_birth = datetime.min
 
-        # 2) Bangun daftar set_urls
-        payload_items: List[dict] = []
-        total_links = 0
-        sent_names = set()  # hindari nama duplikat (opsional)
-
-        for key, cam_list in CAMERA_MAP.items():
+        while True:
+            # 1) Login
             try:
-                online_devs = get_online_devices(s, jsession, key)
+                if ALWAYS_LOGIN_EACH_LOOP:
+                    new_js = login(s)
+                    if jsession is None:
+                        print(f"[OK] Login (loop). JSESSIONID={new_js}")
+                    elif new_js != jsession:
+                        print(f"[OK] Login (loop). JSESSIONID berubah: {jsession} -> {new_js}")
+                    else:
+                        print("[OK] Login (loop). JSESSIONID tetap sama.")
+                    jsession = new_js
+                    js_birth = datetime.utcnow()
+                else:
+                    need_login = (jsession is None) or \
+                                 ((datetime.utcnow() - js_birth).total_seconds() > SESSION_MAX_AGE_SECONDS)
+                    if need_login:
+                        jsession = login(s)
+                        js_birth = datetime.utcnow()
+                        print(f"[OK] Login. JSESSIONID={jsession}")
             except Exception as e:
-                print(f"[WARN] Gagal ambil device '{key}': {e}")
-                online_devs = []
-
-            if not online_devs:
-                print(f"\n[{key}] (device online: 0) — skip")
+                print(f"[ERR] Login gagal: {e}. Coba lagi {RESCAN_INTERVAL_SECONDS}s.")
+                time.sleep(RESCAN_INTERVAL_SECONDS)
                 continue
 
-            print(f"\n[{key}] (device online: {len(online_devs)})")
-            for did in online_devs:
-                print(f"  DevIDNO={did}")
-                for cam_name, ch in cam_list:
-                    rtsp = build_rtsp(jsession, devidno=did, channel=ch, stream=DEFAULT_STREAM)
+            # 2) Snapshot saat ini
+            try:
+                snap = collect_snapshot(s, jsession)
+            except Exception as e:
+                print(f"[ERR] Collect snapshot gagal: {e}")
+                time.sleep(RESCAN_INTERVAL_SECONDS)
+                continue
 
-                    # === PENTING: pakai nama yang server kenal ===
-                    nice_name = choose_display_name(cam_name, key, did, ch)
+            if not snap:
+                print("[INFO] Belum ada device online.")
+                time.sleep(RESCAN_INTERVAL_SECONDS)
+                continue
 
-                    # Hindari duplikasi nama (opsional)
-                    if nice_name in sent_names:
-                        print(f"    [SKIP] Duplicate name '{nice_name}' untuk {key}/{did} ch{ch}")
-                        continue
-                    sent_names.add(nice_name)
+            # 3) Delta vs cache
+            delta = diff_delta(snap, cache)
+            if not delta:
+                print("[INFO] Tidak ada perubahan URL/name. Skip kirim.")
+                time.sleep(RESCAN_INTERVAL_SECONDS)
+                continue
 
-                    print(f"    {nice_name} -> {rtsp}")
-                    payload_items.append({"name": nice_name, "url": rtsp})
-                    total_links += 1
+            # 4) Kirim delta PER 3 item (tetap batch=3)
+            sent = 0
+            for batch in chunked(delta, CLIENT_BATCH_SIZE):
+                all_ok, succeeded = post_set_urls(s, batch)
+                if succeeded:
+                    for it in succeeded:
+                        cache[it["name"]] = it["url"]  # update cache utk yang sukses
+                    sent += len(succeeded)
+                _sleep_with_jitter(SLEEP_BETWEEN_BATCH)
 
-        print(f"\n[INFO] Total RTSP yang dikumpulkan: {total_links}")
-
-        # 3) Kirim ke endpoint /run PER 3 ITEM (CLIENT_BATCH_SIZE)
-        if not payload_items:
-            print("[INFO] Tidak ada item untuk dikirim.")
-            return
-
-        sent = 0
-        all_ok = True
-        for batch in chunked(payload_items, CLIENT_BATCH_SIZE):
-            ok = post_set_urls(s, batch)
-            if ok:
-                sent += len(batch)
+            if sent > 0:
+                _save_cache(cache)
+                print(f"[OK] Delta terkirim: {sent}/{len(delta)} & cache updated.")
             else:
-                all_ok = False
-            _sleep_with_jitter(SLEEP_BETWEEN_BATCH)
+                print(f"[WARN] Tidak ada item delta yang sukses terkirim kali ini.")
 
-        if all_ok:
-            print(f"[DONE] Semua terkirim. Total: {sent}")
-        else:
-            print(f"[DONE*] Sebagian terkirim. Berhasil: {sent}/{len(payload_items)}")
+            time.sleep(RESCAN_INTERVAL_SECONDS)
+
+# ===================== RUN =====================
+def main():
+    loop_resilient()
 
 if __name__ == "__main__":
     main()

@@ -3,3 +3,4 @@
 __pycache__
 /out
 camera_map.json
+last_sent.json
